@@ -66,6 +66,7 @@
 #include "kern_donor.hpp"
 #include "kern_tgl_csb.hpp"
 #include "kern_tgl_context_cache.hpp"
+#include "kern_tgl_noposh.hpp"
 #include "kern_tgl_gsync.hpp"
 #include "kern_tgl_rpcs.hpp"
 #include "kern_tgl_vm.hpp"
@@ -82,6 +83,7 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_gpurec.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -498,9 +500,42 @@ static bool tglCPSRestorePointer(void *context,uintptr_t caller) {
  __atomic_fetch_add(&tglCPSCounts[15],1,__ATOMIC_RELAXED);
  return true;
 }
+// -wex-tgl-no-posh (kern_tgl_noposh.hpp). Enabled only after every native
+// site below was qualified; the flag is cleared before the native copy so the
+// POCS image is never restored, then each successful copy (initWithOptions
+// AND beginReset) gets the non-POSH CTX_CTRL and a zero POSH_LRCA.
+bool tglNoPOSHEnabled {};
+uint32_t tglNoPOSHCounts[TGLNoPOSH::Slots] {};
+static void tglNoPOSHAfterRestore(void *context,bool initCaller) {
+ auto c=static_cast<uint8_t *>(context);
+ if(!c || c[TGLNoPOSH::EngineOffset]!=0 || (c[TGLNoPOSH::FlagsOffset]&TGLNoPOSH::POSHFlag))return;
+ auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
+ if(!buffer || !tglCPSCPUAddress)return;
+ auto image=reinterpret_cast<uint8_t *(*)(void *)>(tglCPSCPUAddress)(buffer);
+ const auto result=TGLNoPOSH::sanitize(image,*reinterpret_cast<uint64_t *>(buffer+0x20));
+ if(result&TGLNoPOSH::Mismatch) {__atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::LayoutMismatch],1,__ATOMIC_RELAXED);return;}
+ if(result&TGLNoPOSH::ZeroedLRCA)__atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::LRCAZeroed],1,__ATOMIC_RELAXED);
+ if(result&TGLNoPOSH::ClearedControl)__atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::ControlCleared],1,__ATOMIC_RELAXED);
+ // Same publication rule as tglCPSRestorePointer: lines 0x1000 and 0x10C0.
+ asm volatile("clflush (%0)"::"r"(image+TGLNoPOSH::ControlOffset):"memory");
+ asm volatile("clflush (%0)"::"r"(image+TGLNoPOSH::LRCAOffset):"memory");
+ asm volatile("mfence":::"memory");
+ __atomic_fetch_add(&tglNoPOSHCounts[initCaller?TGLNoPOSH::InitSanitized:TGLNoPOSH::ResetSanitized],1,__ATOMIC_RELAXED);
+}
 bool tglCPSRestore(void *context) {
  const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+ const bool noPOSH=__atomic_load_n(&tglNoPOSHEnabled,__ATOMIC_ACQUIRE) && context &&
+  static_cast<uint8_t *>(context)[TGLNoPOSH::EngineOffset]==0;
+ if(noPOSH) {
+  __atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::Calls],1,__ATOMIC_RELAXED);
+  if(TGLNoPOSH::clearFlag(static_cast<uint8_t *>(context)))
+   __atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::FlagCleared],1,__ATOMIC_RELAXED);
+ }
  const bool result=FunctionCast(tglCPSRestore,tglCPSRestoreOriginal)(context);
+ if(noPOSH) {
+  if(result)tglNoPOSHAfterRestore(context,caller==tglCPSRestoreCaller);
+  else __atomic_fetch_add(&tglNoPOSHCounts[TGLNoPOSH::RestoreFalse],1,__ATOMIC_RELAXED);
+ }
  if(result && caller==tglCPSRestoreCaller)adlnCaptureOwnedGolden(context);
  return result && tglCPSRestorePointer(context,caller) &&
   (caller!=tglCPSRestoreCaller || tglAlderLakeNGoldenRestore(context));
@@ -510,6 +545,34 @@ bool tglCPSSerialize(void *,void *,OSSerialize *serializer) {
  for(unsigned i=0;i<17;++i)out[i+1]=__atomic_load_n(&tglCPSCounts[i],__ATOMIC_RELAXED);
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// TGLNoPOSHLive: revision 1, enabled, then TGLNoPOSH::Count slots.
+bool tglNoPOSHSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[2+TGLNoPOSH::Slots] {1,__atomic_load_n(&tglNoPOSHEnabled,__ATOMIC_RELAXED)?1U:0U};
+ for(unsigned i=0;i<TGLNoPOSH::Slots;++i)out[2+i]=__atomic_load_n(&tglNoPOSHCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Exact donor sites the no-POSH contract depends on. Read-only qualification;
+// the only code change is the existing restoreFromSafeImage route.
+static __attribute__((noinline)) bool tglQualifyNoPOSH(mach_vm_address_t address,size_t size) {
+ static const uint8_t allocate[] {0x41,0xF6,0x45,0x6E,0x10,0x74,0x2C};               // 0x7BB13 POCS allocation
+ static const uint8_t clone[] {0x41,0xF6,0x45,0x6E,0x10,0x0F,0x85,0xE7,0x00,0x00,0x00,  // 0x7C15E clone branch
+  0xB8,0xEF,0xFF,0xEF,0xFF,0x41,0x23,0x87,0x0C,0x10,0x00,0x00,0x0D,0x00,0x00,0x10,0x00};
+ static const uint8_t restore[] {0x41,0xF6,0x44,0x24,0x6E,0x10,0x74,0x31};           // 0x7C421 POCS copy
+ static const uint8_t reset[] {0xE8,0x74,0xFA,0xFF,0xFF};                            // 0x7C919 beginReset call
+ static const uint8_t batch[] {0x31,0xC9,0x83,0xE0,0x10,0x48,0xC1,0xE0,0x10};       // 0x4301F BB_START bit 20
+ static const uint8_t params[] {0,0,0x1C,0,0,0,0,0,0,0,0,0};                          // 0xB09A4, 0xB0BC0
+ if(size<=0xC04A0+TGLNoPOSH::LRCARegisterOffset-0x1000+4)return false;
+ auto at=[address](uint32_t offset){return reinterpret_cast<const void *>(address+offset);};
+ uint32_t control=0,lrca=0;
+ memcpy(&control,at(0xC04A0+TGLNoPOSH::ControlRegisterOffset-0x1000),4);
+ memcpy(&lrca,at(0xC04A0+TGLNoPOSH::LRCARegisterOffset-0x1000),4);
+ return !memcmp(at(0x7BB13),allocate,sizeof(allocate)) && !memcmp(at(0x7C15E),clone,sizeof(clone)) &&
+  !memcmp(at(0x7C421),restore,sizeof(restore)) && !memcmp(at(0x7C919),reset,sizeof(reset)) &&
+  !memcmp(at(0x4301F),batch,sizeof(batch)) && !memcmp(at(0xB09A4),params,sizeof(params)) &&
+  !memcmp(at(0xB0BC0),params,sizeof(params)) &&
+  control==TGLNoPOSH::ControlRegister && lrca==TGLNoPOSH::LRCARegister;
 }
 // Constructor return is before scheduler submission. This covers fresh RCS
 // images and safe-image clones; beginReset later restores the qualified image.
@@ -11352,6 +11415,7 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+bool tglInstallGpuRec(KernelPatcher &,size_t,mach_vm_address_t,size_t,bool); // -wex-tgl-gpurec
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -12056,6 +12120,16 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
+			// -wex-tgl-no-posh rides on the restoreFromSafeImage route above. Tiger
+			// Lake only: ADL-N/ADL-P/RPL already select the no-POCS factory profile.
+			if(checkKernelArgument("-wex-tgl-no-posh")) {
+				const bool noPOSH=cpsOK && !adlnDetected && tglQualifyNoPOSH(address,size);
+				__atomic_store_n(&tglNoPOSHEnabled,noPOSH,__ATOMIC_RELEASE);
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLNoPOSHReady",noPOSH);
+				if(auto live=OSSerializer::forTarget(nullptr,tglNoPOSHSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLNoPOSHLive",live);live->release();
+				}
+			}
 			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
 			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
 			bool contextCacheOK=!contextCacheRequested;
@@ -12277,6 +12351,14 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
+			// -wex-tgl-gpurec: Tiger Lake host scheduler only, after
+			// installTGLCSB12 (its 0x3A3A4 head value is part of the check).
+			{
+				const bool registers=checkKernelArgument("-wex-tgl-gpurec");
+				if(registers && !(recoveryRequested && recoveryOK && hostOK && !adlnDetected &&
+				    tglInstallGpuRec(patcher,index,address,size,registers)))
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLGpuRecReady",false);
+			}
 			// These resource checks also precede probe/start. Include them in
 			// admission reporting so an installed patch set cannot hide an
 			// accelerator rejected before either native lifecycle callback.
@@ -15265,6 +15347,226 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+// -wex-tgl-gpurec (kern_tgl_gpurec.hpp). Runs inside native recovery (IOAccel
+// work loop); no allocation, IORegistry mutation or logging there, counters
+// only. The -wex-tgl-stampfix (eventTimeout) and -wex-tgl-gpurec-halt halves
+// of the candidate patch are deliberately not transplanted.
+struct TGLGpuRecState {
+ uintptr_t forceWake {},nativeDefault {},s5Process {};
+ uintptr_t lists[2] {};
+ bool registers {};
+ uint32_t good[2][TGLGpuRec::MaxEntries] {};bool goodOK[2] {};
+ uint32_t extrasSnapshot[5] {},extrasGood[5] {};bool snapshotOK {},extrasGoodOK {};
+ uint8_t *volatile pendingOwner {};volatile uint8_t *volatile pendingBar {};
+ uint32_t counts[TGLGpuRec::Slots] {};
+} tglGpuRec;
+mach_vm_address_t tglGpuRecOrgReset {};
+inline uint32_t tglGpuRecRead(volatile uint8_t *bar,uint32_t r) {return *reinterpret_cast<volatile uint32_t *>(bar+r);}
+inline void tglGpuRecWrite(volatile uint8_t *bar,uint32_t r,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(bar+r)=v;}
+void tglGpuRecCount(unsigned slot) {__atomic_fetch_add(&tglGpuRec.counts[slot],1,__ATOMIC_RELAXED);}
+void tglGpuRecStore(unsigned slot,uint32_t value) {__atomic_store_n(&tglGpuRec.counts[slot],value,__ATOMIC_RELAXED);}
+// initModeRegisters' RCS whitelist gate (0x28EBA): accel+0x1191 bit 0; the
+// last two constants also need bit 25 of accel+0xFE6.
+inline bool tglGpuRecWhitelistOptional(const uint8_t *owner) {
+ uint32_t flags=0;memcpy(&flags,owner+0xFE6,sizeof(flags));return (flags>>25)&1;
+}
+uint32_t tglGpuRecFixWhitelist(uint8_t *owner,volatile uint8_t *bar) {
+ const uint32_t rewrite=TGLGpuRec::fixWhitelist([bar](uint32_t r) {return tglGpuRecRead(bar,r);},
+  [bar](uint32_t r,uint32_t v) {tglGpuRecWrite(bar,r,v);},owner[0x1191]&1,tglGpuRecWhitelistOptional(owner));
+ if(rewrite)tglGpuRecCount(TGLGpuRec::WhitelistFixes);
+ return rewrite;
+}
+// Native restore rule over one list, then the RCS whitelist again, so a
+// snapshot value can never be the last FORCE_TO_NONPRIV write.
+uint32_t tglGpuRecRestoreList(uint8_t *owner,volatile uint8_t *bar,const TGLGpuRec::List &l,const uint32_t *saved) {
+ auto nativeDefault=reinterpret_cast<uint32_t (*)(void *,uint32_t)>(tglGpuRec.nativeDefault);
+ const uint32_t rewrite=TGLGpuRec::restoreList(l,saved,[owner,nativeDefault](uint32_t r) {return nativeDefault(owner,r);},
+  [bar](uint32_t r) {return tglGpuRecRead(bar,r);},[bar](uint32_t r,uint32_t v) {tglGpuRecWrite(bar,r,v);},
+  owner[0x1191]&1,tglGpuRecWhitelistOptional(owner));
+ if(rewrite)tglGpuRecCount(TGLGpuRec::WhitelistFixes);
+ return rewrite;
+}
+// beforeReplay: called between GDRST and the own replay; record what the
+// reset left in RCU_MODE before anything is rewritten.
+uint32_t tglGpuRecFixExtras(uint8_t *owner,volatile uint8_t *bar,bool beforeReplay) {
+ auto &g=tglGpuRec;if(!g.registers || !owner || !bar)return 0;
+ uint64_t features;memcpy(&features,owner+0x1190,sizeof(features));
+ uint32_t live[5],value[5] {};
+ for(unsigned i=0;i<5;++i)live[i]=tglGpuRecRead(bar,TGLGpuRec::Extras[i]);
+ if(beforeReplay) {tglGpuRecStore(TGLGpuRec::PreFixRCU,live[0]);tglGpuRecCount(TGLGpuRec::PreFixReads);}
+ const uint32_t *good=g.snapshotOK?g.extrasSnapshot:(g.extrasGoodOK?g.extrasGood:nullptr);
+ const uint32_t mask=TGLGpuRec::plan(live,good,TGLGpuRec::ccsEnabled(features),value);
+ for(unsigned i=0;i<5;++i)if(mask&(1U<<i))tglGpuRecWrite(bar,TGLGpuRec::Extras[i],value[i]);
+ uint32_t rcu=live[0];
+ if(mask) {rcu=tglGpuRecRead(bar,TGLGpuRec::Extras[0]);tglGpuRecCount(TGLGpuRec::ExtrasFixes);} // posting read
+ tglGpuRecStore(TGLGpuRec::LastRCU,rcu); // post-fix value
+ // initModeRegisters' RCS whitelist constants (see kern_tgl_gpurec.hpp).
+ const uint32_t rewrite=tglGpuRecFixWhitelist(owner,bar);
+ return mask|(rewrite?0x100U:0U);
+}
+// Called first in wrapTGLCSBReset: native order is GDRST -> own list restore
+// -> scheduler processGPUReset -> CSB/ELSP replay. Re-enable the CCS before it.
+void tglGpuRecBeforeReplay() {
+ auto owner=tglGpuRec.pendingOwner;auto bar=tglGpuRec.pendingBar;
+ if(owner && bar)tglGpuRecFixExtras(owner,bar,true);
+}
+bool tglGpuRecResetGraphicsEngine(void *ring,void *context) {
+ auto original=FunctionCast(tglGpuRecResetGraphicsEngine,tglGpuRecOrgReset);
+ auto &g=tglGpuRec;auto r=static_cast<uint8_t *>(ring);
+ if(!g.registers || !r)return original(ring,context);
+ auto owner=*reinterpret_cast<uint8_t **>(r+0x10);
+ auto bar=*reinterpret_cast<volatile uint8_t **>(r+0x50);
+ const uint32_t domain=*reinterpret_cast<uint32_t *>(r+0x70);
+ const auto ownList=*reinterpret_cast<uintptr_t *>(r+0x78);
+ const uint8_t type=r[0x40];
+ const int own=ownList==g.lists[0]?0:ownList==g.lists[1]?1:-1;
+ if(!owner || owner!=tglHost.owner || !bar || !(domain&2) || own<0 || type!=own)return original(ring,context);
+ const int sibling=1-own;
+ TGLGpuRec::List sl {},ol {};
+ if(!TGLGpuRec::list(reinterpret_cast<const void *>(g.lists[sibling]),sibling,sl) ||
+    !TGLGpuRec::list(reinterpret_cast<const void *>(g.lists[own]),own,ol)) {
+  tglGpuRecCount(TGLGpuRec::ListInvalid);return original(ring,context);
+ }
+ auto wake=reinterpret_cast<void (*)(void *,bool,unsigned)>(g.forceWake);
+ wake(owner,true,7); // counted entry; native reset nests its own
+ uint32_t snapshot[TGLGpuRec::MaxEntries],ownSnapshot[TGLGpuRec::MaxEntries];
+ for(uint64_t i=0;i<sl.count;++i)snapshot[i]=tglGpuRecRead(bar,TGLGpuRec::reg(sl,i));
+ for(uint64_t i=0;i<ol.count;++i)ownSnapshot[i]=tglGpuRecRead(bar,TGLGpuRec::reg(ol,i));
+ if(snapshot[0]) {memcpy(g.good[sibling],snapshot,sl.count*4);g.goodOK[sibling]=true;}
+ if(ownSnapshot[0]) {memcpy(g.good[own],ownSnapshot,ol.count*4);g.goodOK[own]=true;}
+ // Engine flags 0x4/0x8 select the native ring-kick path, which may skip GDRST.
+ auto engine=*reinterpret_cast<uint8_t **>(r+0x8B8+uint64_t(type)*8);
+ const bool kick=engine && (*reinterpret_cast<uint32_t *>(engine+0xA4)&0xC);
+ uint64_t features;memcpy(&features,owner+0x1190,sizeof(features));
+ uint32_t extras[5];for(unsigned i=0;i<5;++i)extras[i]=tglGpuRecRead(bar,TGLGpuRec::Extras[i]);
+ g.snapshotOK=TGLGpuRec::healthy(extras,TGLGpuRec::ccsEnabled(features));
+ if(g.snapshotOK) {memcpy(g.extrasSnapshot,extras,sizeof(extras));memcpy(g.extrasGood,extras,sizeof(extras));g.extrasGoodOK=true;}
+ // A CCS that start-up never enabled (accel+0x1190 bit 33) has nothing to
+ // restore; never write a list that was not seen healthy at least once.
+ const bool siblingInUse=sibling==0 || TGLGpuRec::ccsEnabled(features);
+ // The IGScheduler5 instance: vtable+0x190 is the qualified processGPUReset.
+ auto scheduler=*reinterpret_cast<uint8_t **>(owner+0x1250);
+ auto vtable=scheduler?*reinterpret_cast<uintptr_t **>(scheduler):nullptr;
+ const bool schedulerOK=vtable && vtable[0x190/8]==g.s5Process;
+ // Read-only POCS observation (kern_tgl_gpurec.hpp): never written.
+ tglGpuRecStore(TGLGpuRec::PocsBefore,tglGpuRecRead(bar,TGLGpuRec::Pocs[0]));
+ tglGpuRecStore(TGLGpuRec::Pocs88Before,tglGpuRecRead(bar,TGLGpuRec::Pocs[1]));
+ g.pendingBar=bar;g.pendingOwner=owner;
+ const bool ok=original(ring,context);
+ g.pendingOwner=nullptr;g.pendingBar=nullptr;
+ tglGpuRecStore(TGLGpuRec::PocsAfter,tglGpuRecRead(bar,TGLGpuRec::Pocs[0]));
+ tglGpuRecStore(TGLGpuRec::Pocs88After,tglGpuRecRead(bar,TGLGpuRec::Pocs[1]));
+ const uint32_t extrasFixed=tglGpuRecFixExtras(owner,bar,false);
+ const uint32_t siblingHWS=tglGpuRecRead(bar,TGLGpuRec::reg(sl,0));
+ const bool lost=snapshot[0]?siblingHWS==0:true;
+ const bool reset=!kick || (snapshot[0] && siblingHWS==0);
+ tglGpuRecCount(TGLGpuRec::Resets);
+ uint32_t did=0;
+ if(ok && reset && lost && siblingInUse && (snapshot[0] || g.goodOK[sibling])) {
+  const uint32_t *source=snapshot[0]?snapshot:(g.goodOK[sibling]?g.good[sibling]:snapshot);
+  // Each list restore re-applies the RCS whitelist afterwards (ordering fix:
+  // the extras pass above ran before these snapshot writes).
+  if(tglGpuRecRestoreList(owner,bar,sl,source))did|=8;
+  tglGpuRecCount(TGLGpuRec::SiblingRestores);did|=1;
+  if(!tglGpuRecRead(bar,TGLGpuRec::reg(ol,0)) && g.goodOK[own]) {
+   if(tglGpuRecRestoreList(owner,bar,ol,g.good[own]))did|=8;
+   tglGpuRecCount(TGLGpuRec::OwnFixes);did|=2;
+  }
+  // Replay through the scheduler vtable so the routed CSB12 reset keeps its
+  // software head in step (wrapTGLCSBProcess panics on a mismatch). TGLCSBIO
+  // panics on a streamer without HWSP/descriptor: require an initialized one.
+  auto streamer=scheduler?*reinterpret_cast<uint8_t **>(scheduler+0xCA0+uint64_t(sibling)*8):nullptr;
+  auto descriptor=streamer?*reinterpret_cast<uint8_t **>(streamer+0x28):nullptr;
+  const bool csbReady=streamer && *reinterpret_cast<void **>(streamer+0x68) &&
+   (!tglCSB12Enabled || (tglCSBEngines[sibling].streamer==streamer && tglCSBEngines[sibling].hardwareReady));
+  if(schedulerOK && descriptor && descriptor[0]==sibling && csbReady) {
+   // With no active execlist element the native streamer reset takes the je
+   // at 0x3A3C8 to its epilogue (0x3A52B): no beginReset or resubmission. It
+   // has already rewritten the CSB head ([rdi+0x1C04] and HWSP+0xBC at
+   // 0x3A3A9/0x3A3B3), so a replay without a resubmit still resets the head.
+   const bool active=TGLGpuRec::activeElement(streamer);
+   reinterpret_cast<void (*)(void *,uint32_t,void *)>(g.s5Process)(scheduler,static_cast<uint32_t>(sibling),nullptr);
+   tglGpuRecCount(TGLGpuRec::SiblingReplays);did|=4;
+   if(active)tglGpuRecCount(TGLGpuRec::SiblingResubmits);
+  } else tglGpuRecCount(TGLGpuRec::SiblingNotReady);
+ } else if(kick && !reset) tglGpuRecCount(TGLGpuRec::KickSkips);
+ if(extrasFixed)did|=8;
+ wake(owner,false,7);
+ __atomic_store_n(&g.counts[TGLGpuRec::Last],uint32_t(own)|(uint32_t(ok)<<4)|(uint32_t(kick)<<5)|(did<<8)|(snapshot[0]&0xFFFFF000U),__ATOMIC_RELAXED);
+ return ok;
+}
+// TGLGpuRecLive: {TGLGpuRec::LiveRevision, TGLGpuRec::Flag bits, Slots counters}.
+bool tglGpuRecSerialize(void *,void *,OSSerialize *serializer) {
+ const auto &g=tglGpuRec;
+ const uint32_t flags=(g.registers?TGLGpuRec::RegistersFlag:0U)|
+  (__atomic_load_n(&tglNoPOSHEnabled,__ATOMIC_RELAXED)?0U:TGLGpuRec::WithPOSHFlag);
+ uint32_t out[2+TGLGpuRec::Slots] {TGLGpuRec::LiveRevision,flags};
+ for(unsigned i=0;i<TGLGpuRec::Slots;++i)out[2+i]=__atomic_load_n(&g.counts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
+// Qualify every native address and instruction the register recovery relies
+// on, then route resetGraphicsEngine. -wex-tgl-stampfix (eventTimeout) and
+// -wex-tgl-gpurec-halt are not installed by this build.
+bool tglInstallGpuRec(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool registers) {
+ struct Site {const char *symbol;uint32_t offset;};
+ static const Site sites[] {
+  {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",0x43576},
+  {"__ZN16IntelAccelerator13SafeForceWakeEbj",0x28C2A},
+  {"__ZN16IntelAccelerator20getDefaultResetValueEj",0x2E60A},
+  {"__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext",0x380D8},
+  {"__ZN16IntelAccelerator17initModeRegistersEv",0x28E1A},
+  {"__ZN26IGHardwareCommandStreamer515processGPUResetEv",0x3A396},
+  {"_rcsResetRegisters",0x14B2B0},
+  {"_ccsResetRegisters",0x14AEB8},
+ };
+ static const uint8_t gdrst[] {0xC7,0x80,0x08,0x4A,0x00,0x00,0x04,0x00,0x04,0x00,0x41,0x8B,0x4C,0x24,0x70,0x89,0x88,0x1C,0x94,0x00,0x00};
+ static const uint8_t replay[] {0x41,0x0F,0xB6,0x74,0x24,0x40,0x48,0x8B,0x07,0x48,0x8B,0x55,0xD0,0xFF,0x90,0x90,0x01,0x00,0x00};
+ static const uint8_t flags[] {0x41,0x0F,0xB6,0x44,0x24,0x40,0x49,0x8B,0x84,0xC4,0xB8,0x08,0x00,0x00,0x8B,0x88,0xA4,0x00,0x00,0x00};
+ static const uint8_t s5[] {0x89,0xF0,0x48,0x8B,0xBC,0xC7,0xA0,0x0C,0x00,0x00};
+ static const uint8_t rcu[] {0xB9,0xFE,0xFF,0xFE,0xFF,0x23,0x88,0x00,0x48,0x01,0x00,0x48,0x8B,0x97,0x90,0x11,0x00,0x00,
+  0x48,0xC1,0xEA,0x21,0x83,0xE2,0x01,0x8D,0x8C,0x11,0x00,0x00,0x01,0x00,0x89,0x88,0x00,0x48,0x01,0x00};
+ static const uint8_t nonpriv[] {0xC7,0x80,0xD0,0xA4,0x01,0x00,0x34,0xB1,0x00,0x00};
+ // 0x28EBA: test accel+0x1191 bit 0, then the RCS whitelist stores mirrored by TGLGpuRec::Whitelist.
+ static const uint8_t whitelist[] {0xF6,0x87,0x91,0x11,0x00,0x00,0x01,0x74,0x6E,
+  0xC7,0x80,0xD0,0x24,0x00,0x00,0x00,0xE1,0x00,0x00,0xC7,0x80,0xD4,0x24,0x00,0x00,0x10,0x70,0x00,0x00,
+  0xC7,0x80,0xD8,0x24,0x00,0x00,0x34,0xB1,0x00,0x00,0xC7,0x80,0xDC,0x24,0x00,0x00,0x08,0x70,0x00,0x00,
+  0xC7,0x80,0xE0,0x24,0x00,0x00,0x80,0x25,0x00,0x00,0xC7,0x80,0xF0,0x24,0x00,0x00,0x1C,0x73,0x00,0x00,
+  0xC7,0x80,0xF4,0x24,0x00,0x00,0x44,0x22,0x00,0x00,0x0F,0xBA,0xA7,0xE6,0x0F,0x00,0x00,0x19,0x73,0x14,
+  0xC7,0x80,0xF8,0x24,0x00,0x00,0x51,0x23,0x00,0x10,0xC7,0x80,0xFC,0x24,0x00,0x00,0x41,0x23,0x00,0x10};
+ // 0x3A3B9: the active execlist element load and its early return (TGLGpuRec::activeElement).
+ static const uint8_t element[] {0x8B,0x47,0x50,0x48,0xC1,0xE0,0x04,0x48,0x8B,0x5C,0x07,0x30,0x48,0x85,0xDB,0x0F,0x84,0x5D,0x01,0x00,0x00};
+ bool ok=size>0x14B2B0+0x18;
+ for(const auto &s:sites)ok=ok && patcher.solveSymbol<mach_vm_address_t>(index,s.symbol,address,size)==address+s.offset;
+ patcher.clearError();
+ auto at=[address](uint32_t offset){return reinterpret_cast<const uint8_t *>(address+offset);};
+ // CSB head reset: native 7, or 11 once installTGLCSB12 patched 0x3A3A4.
+ const uint8_t head=ok?at(0x3A3A4)[1]:0;
+ ok=ok && !memcmp(at(0x43769),gdrst,sizeof(gdrst)) && !memcmp(at(0x4384E),replay,sizeof(replay)) &&
+  !memcmp(at(0x43625),flags,sizeof(flags)) && !memcmp(at(0x380DC),s5,sizeof(s5)) &&
+  !memcmp(at(0x28E7E),rcu,sizeof(rcu)) && !memcmp(at(0x28F27),nonpriv,sizeof(nonpriv)) &&
+  !memcmp(at(0x28EBA),whitelist,sizeof(whitelist)) &&
+  at(0x3A3A4)[0]==0xB8 && (head==7 || (head==11 && tglCSB12Enabled)) && !memcmp(at(0x3A3B9),element,sizeof(element));
+ auto &g=tglGpuRec;
+ if(ok) {
+  g.forceWake=address+0x28C2A;g.nativeDefault=address+0x2E60A;g.s5Process=address+0x380D8;
+  g.lists[0]=address+0x14B2B0;g.lists[1]=address+0x14AEB8;
+ }
+ if(ok && registers) {
+  KernelPatcher::RouteRequest route {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",
+   tglGpuRecResetGraphicsEngine,tglGpuRecOrgReset};
+  g.registers=patcher.routeMultiple(index,&route,1,address,size) && tglGpuRecOrgReset;
+  patcher.clearError();
+ }
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(registers)root->setProperty("TGLGpuRecReady",g.registers);
+ // Results differ with and without POSH: GPUREC cannot repair the POCS.
+ if(registers)root->setProperty("TGLGpuRecWithPOSH",!__atomic_load_n(&tglNoPOSHEnabled,__ATOMIC_ACQUIRE));
+ if(auto live=OSSerializer::forTarget(nullptr,tglGpuRecSerialize)) {root->setProperty("TGLGpuRecLive",live);live->release();}
+ return ok;
+}
+
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
@@ -15366,6 +15668,7 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 void XE::wrapTGLCSBReset(void *streamer) {
+ tglGpuRecBeforeReplay(); // no-op unless a qualified render-domain reset is in progress
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
